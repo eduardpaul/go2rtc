@@ -130,8 +130,8 @@ func (c *Codec) Match(remote *Codec) bool {
 	}
 
 	return c.Name == remote.Name &&
-		(c.ClockRate == remote.ClockRate || remote.ClockRate == 0) &&
-		(c.Channels == remote.Channels || remote.Channels == 0)
+		(c.ClockRate == remote.ClockRate || remote.ClockRate == 0 || c.ClockRate == 0) &&
+		(c.Channels == remote.Channels || remote.Channels == 0 || c.Channels == 0)
 }
 
 func UnmarshalCodec(md *sdp.MediaDescription, payloadType string) *Codec {
