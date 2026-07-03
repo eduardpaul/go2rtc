@@ -329,12 +329,21 @@ func (c *Client) AddTrack(media *core.Media, codec *core.Codec, track *core.Rece
 			}
 
 			now := time.Now()
-			if !lastSent.IsZero() {
-				if expected := lastSent.Add(frameInterval); now.Before(expected) {
+			if lastSent.IsZero() {
+				lastSent = now
+			} else {
+				expected := lastSent.Add(frameInterval)
+				if now.Before(expected) {
 					time.Sleep(expected.Sub(now))
+					lastSent = expected
+				} else {
+					if now.Sub(expected) > 100*time.Millisecond {
+						lastSent = now
+					} else {
+						lastSent = expected
+					}
 				}
 			}
-			lastSent = time.Now()
 
 			auSize := uint16(len(packet.Payload))
 			wrapped := make([]byte, 4+auSize)
