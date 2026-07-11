@@ -4,8 +4,10 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log"
 	"math/rand"
 	"net"
+	"os"
 	"time"
 
 	"github.com/AlexxIT/go2rtc/pkg/aac"
@@ -15,6 +17,24 @@ import (
 	"github.com/AlexxIT/go2rtc/pkg/srtp"
 	"github.com/pion/rtp"
 )
+
+// dbg* counters limit the volume of backchannel diagnostic logging so we can
+// compare the doorbell's real ELD RTP framing (recv) against what we transmit
+// (send) without flooding the container logs.
+var dbgRecvCount, dbgSendCount int
+
+func dbgLogRTP(dir string, p *rtp.Packet, count *int) {
+	if *count >= 15 {
+		return
+	}
+	head := p.Payload
+	if len(head) > 8 {
+		head = head[:8]
+	}
+	log.Printf("[hk-dbg] %s seq=%d ts=%d pt=%d marker=%t ver=%d len=%d head=%x",
+		dir, p.SequenceNumber, p.Timestamp, p.PayloadType, p.Marker, p.Version, len(p.Payload), head)
+	*count++
+}
 
 // Deprecated: rename to Producer
 type Client struct {
@@ -117,19 +137,19 @@ func (c *Client) GetMedias() []*core.Media {
 		},
 	}
 
-	audioMedia := audioToMedia(c.audioConfig.Codecs)
-	backchannelCodecs := make([]*core.Codec, 0, len(audioMedia.Codecs)+1)
-	backchannelCodecs = append(backchannelCodecs, audioMedia.Codecs...)
-	backchannelCodecs = append(backchannelCodecs, &core.Codec{
-		Name:      core.CodecAAC,
-		ClockRate: 16000,
-		Channels:  1,
-	})
-
+	// PR #1981: advertise a single clean AAC-ELD sendonly speaker codec.
+	// A messy list (all recv codecs + a plain AAC) makes RTSP MatchMedia pick
+	// the wrong codec/config for the ffmpeg talkback producer.
 	c.Medias = append(c.Medias, &core.Media{
 		Kind:      core.KindAudio,
 		Direction: core.DirectionSendonly,
-		Codecs:    backchannelCodecs,
+		Codecs: []*core.Codec{
+			{
+				Name:      core.CodecELD,
+				ClockRate: 16000,
+				Channels:  1,
+			},
+		},
 	})
 
 	return c.Medias
@@ -190,6 +210,7 @@ func (c *Client) Start() error {
 
 		if audioTrack != nil {
 			c.audioSession.OnReadRTP = func(packet *rtp.Packet) {
+				dbgLogRTP("recv-audio", packet, &dbgRecvCount)
 				audioTrack.WriteRTP(packet)
 				c.Recv += len(packet.Payload)
 			}
@@ -294,78 +315,109 @@ func timekeeper(handler core.HandlerFunc) core.HandlerFunc {
 }
 
 // AddTrack sends backchannel (talkback) audio to the camera.
+//
+// Combines PR #1981's AAC-ELD codec detection (so the HomeKit audio session is
+// negotiated as ELD/16000) with single-AU packetization that mirrors the
+// doorbell's OWN mic stream: exactly one AU per RTP packet, timestamp +480
+// (30ms @ 16kHz), marker=false, paced at 30ms. Our upstream ffmpeg RTSP
+// producer bundles ~14 AUs per MPEG4-GENERIC packet, which the Aqara G4 will
+// not render; we must split those bundles back to one AU per packet.
 func (c *Client) AddTrack(media *core.Media, codec *core.Codec, track *core.Receiver) error {
 	const sampleRate = 16000
-	const sampleSize = 480 // 30ms @ 16kHz, matches negotiated RTPTime
+	// libfdk_aac's aac_eld encoder IGNORES -frame_size 480 and always emits
+	// 512-sample (32ms) frames. Measured empirically: 10s @16kHz -> 314 frames
+	// (160000/314 ~= 512). The RTP timestamp and pacing MUST match the real
+	// frame size, otherwise we feed 32ms of audio every 30ms: the doorbell's
+	// jitter buffer overfills and its audio clock skews, so the speaker plays
+	// the first ~second then mutes. Use 512 to keep the RTP clock at true 16kHz.
+	const sampleSize = 512 // 32ms @ 16kHz — actual libfdk_aac ELD frame length
 	const frameInterval = sampleSize * time.Second / sampleRate
 
 	switch codec.Name {
-	case core.CodecELD, core.CodecOpus, core.CodecAAC:
+	case core.CodecELD, core.CodecOpus:
 		sender := core.NewSender(media, track.Codec)
 
-		var lastSent time.Time
+		log.Printf("[hk-dbg] AddTrack codec=%s trackCodec=%s isRTP=%t pt=%d",
+			codec.Name, track.Codec.Name, track.Codec.IsRTP(), track.Codec.PayloadType)
 
-		// writeRTP sends exactly one AU per RTP packet, wrapped in the
-		// RFC 3640 §3.3.6 "AAC-hbr" AU-header format required by the HAP
-		// spec for AAC-ELD (11.9 Media Transport: "RFC 3640 - Section 3.3.6
-		// - High Bit-rate AAC for AAC-ELD"; sizeLength=13/indexLength=3, see
-		// aac.FMTP, is exactly a 2-byte AU-header): a 2-byte AU-headers-length
-		// field followed by one 2-byte AU-header giving the AU size.
-		//
-		// Timestamp/sequence for the shared backchannel SSRC must persist
-		// across calls (RTP requires monotonic sequence/timestamp for a
-		// given SSRC), and Marker is always true since every packet is
-		// exactly one complete AU.
-		//
-		// Paced with a rolling minimum spacing (time since the last packet
-		// sent, not a fixed schedule from burst start) so consecutive sends
-		// are never closer than one frame interval even if upstream delivery
-		// (ffmpeg -> internal RTSP loopback -> aac.RTPDepay(), which can
-		// unpack several bundled AUs from one incoming packet at once) is
-		// bursty.
+		var lastSent time.Time
+		var started bool
+		// TALKBACK_PACE=1 restores the legacy 32ms per-AU pacing. Default is
+		// no-pace (send AUs as they arrive): the RTP timestamps already carry
+		// correct playback timing (+512 @16kHz), so the doorbell's jitter buffer
+		// schedules by timestamp. Pacing only ADDS latency by holding each ~14-AU
+		// ffmpeg bundle and dripping it out over ~450ms.
+		pace := os.Getenv("TALKBACK_PACE") == "1"
+
 		writeRTP := func(packet *rtp.Packet) {
+			if dbgSendCount < 5 {
+				log.Printf("[hk-dbg] writeRTP entry len=%d sessionNil=%t remoteNil=%t",
+					len(packet.Payload), c.audioSession == nil,
+					c.audioSession != nil && c.audioSession.Remote == nil)
+			}
 			if c.audioSession == nil || c.audioSession.Remote == nil {
 				return
 			}
 
-			now := time.Now()
-			if lastSent.IsZero() {
-				lastSent = now
-			} else {
-				expected := lastSent.Add(frameInterval)
-				if now.Before(expected) {
-					time.Sleep(expected.Sub(now))
-					lastSent = expected
+			// Talkspurt start = the very first packet of the stream. The ffmpeg
+			// source is continuous (encodes silence too), so bundle-arrival gaps
+			// are NOT talkspurts and must not re-trigger the marker.
+			talkspurtStart := !started
+			started = true
+
+			if pace {
+				// Legacy: pace one AU per frame so a bundled ffmpeg packet does
+				// not burst 14 AUs at once. Also re-arm the marker after a gap.
+				now := time.Now()
+				if lastSent.IsZero() {
+					lastSent = now
 				} else {
-					if now.Sub(expected) > 100*time.Millisecond {
+					expected := lastSent.Add(frameInterval)
+					if now.Before(expected) {
+						time.Sleep(expected.Sub(now))
+						lastSent = expected
+					} else if now.Sub(expected) > 100*time.Millisecond {
 						lastSent = now
+						talkspurtStart = true
 					} else {
 						lastSent = expected
 					}
 				}
 			}
 
+			// Wrap the raw AU as a single-AU MPEG4-GENERIC payload:
+			// [AU-headers-length=16][AU-size<<3][AU bytes].
 			auSize := uint16(len(packet.Payload))
 			wrapped := make([]byte, 4+auSize)
-			wrapped[1] = 16 // AU-headers-length in bits: one 16-bit AU-header
+			wrapped[1] = 16
 			binary.BigEndian.PutUint16(wrapped[2:], auSize<<3)
 			copy(wrapped[4:], packet.Payload)
 			packet.Payload = wrapped
 
-			packet.Marker = true
+			// Flag the first packet of each talkspurt so the doorbell's audio
+			// jitter buffer opens/resets playback (RFC 3550 §5.1).
+			packet.Marker = talkspurtStart
 			packet.Timestamp = c.audioSend
 			packet.SequenceNumber = c.audioSeq
 			c.audioSend += sampleSize
 			c.audioSeq++
+
+			dbgLogRTP("send-audio", packet, &dbgSendCount)
 
 			if n, err := c.audioSession.WriteRTP(packet); err == nil {
 				c.Send += n
 			}
 		}
 
+		// Seed the RTP sequence/timestamp once so the stream does not look
+		// stale on a reused SSRC across successive talkback playbacks.
+		if c.audioSeq == 0 && c.audioSend == 0 {
+			c.audioSeq = uint16(rand.Uint32())
+			c.audioSend = rand.Uint32()
+		}
+
 		if track.Codec.IsRTP() {
-			// ffmpeg's own RTP muxer may bundle multiple AAC frames per
-			// packet; split back into one AU per packet before forwarding.
+			// Split bundled MPEG4-GENERIC packets into individual AUs.
 			sender.Handler = aac.RTPDepay(writeRTP)
 		} else {
 			sender.Handler = writeRTP

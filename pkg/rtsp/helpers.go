@@ -2,6 +2,7 @@ package rtsp
 
 import (
 	"bytes"
+	"encoding/hex"
 	"io"
 	"net/url"
 	"regexp"
@@ -89,6 +90,24 @@ func UnmarshalSDP(rawSDP []byte) ([]*core.Media, error) {
 				// fix OPUS for some cameras https://datatracker.ietf.org/doc/html/rfc7587
 				codec.ClockRate = 48000
 				codec.Channels = 2
+			case core.CodecAAC:
+				// Detect AAC-ELD from the config so HomeKit speaker (talkback)
+				// tracks match the camera's sendonly ELD media. PR #1981.
+				if codec.FmtpLine != "" && strings.Contains(codec.FmtpLine, "config=") {
+					configStr := core.Between(codec.FmtpLine, "config=", ";")
+					if configStr == "" {
+						configStr = core.Between(codec.FmtpLine, "config=", "")
+					}
+					if configBytes, err := hex.DecodeString(configStr); err == nil && len(configBytes) > 0 {
+						objType := configBytes[0] >> 3             // first 5 bits
+						if objType == 31 && len(configBytes) > 1 { // ESCAPE
+							objType = 32 + ((configBytes[0]&0x07)<<3 | (configBytes[1] >> 5))
+						}
+						if objType == 39 { // TypeAACELD
+							codec.Name = core.CodecELD
+						}
+					}
+				}
 			}
 		}
 
