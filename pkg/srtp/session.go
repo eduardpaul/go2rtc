@@ -1,6 +1,7 @@
 package srtp
 
 import (
+	"log"
 	"net"
 	"sync"
 	"time"
@@ -161,6 +162,26 @@ func (s *Session) ReadRTCP(b []byte) {
 	b, err := s.Remote.srtp.DecryptRTCP(nil, b, &header)
 	if err != nil {
 		return
+	}
+
+	// [hk-dbg] Log incoming RTCP so we can tell whether the doorbell acknowledges
+	// receiving our talkback stream (ReceiverReport referencing our Local.SSRC).
+	if pkts, perr := rtcp.Unmarshal(b); perr == nil {
+		for _, p := range pkts {
+			switch rr := p.(type) {
+			case *rtcp.ReceiverReport:
+				for _, rep := range rr.Reports {
+					log.Printf("[hk-dbg] rtcp-RR from=%x onSSRC=%x localSSRC=%x fracLost=%d totalLost=%d lastSeq=%d",
+						rr.SSRC, rep.SSRC, s.Local.SSRC, rep.FractionLost, rep.TotalLost, rep.LastSequenceNumber)
+				}
+			case *rtcp.SenderReport:
+				log.Printf("[hk-dbg] rtcp-SR from=%x localSSRC=%x reports=%d", rr.SSRC, s.Local.SSRC, len(rr.Reports))
+				for _, rep := range rr.Reports {
+					log.Printf("[hk-dbg]   SR-report onSSRC=%x localSSRC=%x fracLost=%d totalLost=%d lastSeq=%d jitter=%d",
+						rep.SSRC, s.Local.SSRC, rep.FractionLost, rep.TotalLost, rep.LastSequenceNumber, rep.Jitter)
+				}
+			}
+		}
 	}
 
 	if header.Type != rtcp.TypeSenderReport {
