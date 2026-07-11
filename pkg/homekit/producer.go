@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"net"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/AlexxIT/go2rtc/pkg/aac"
@@ -331,7 +332,6 @@ func (c *Client) AddTrack(media *core.Media, codec *core.Codec, track *core.Rece
 	// jitter buffer overfills and its audio clock skews, so the speaker plays
 	// the first ~second then mutes. Use 512 to keep the RTP clock at true 16kHz.
 	const sampleSize = 512 // 32ms @ 16kHz — actual libfdk_aac ELD frame length
-	const frameInterval = sampleSize * time.Second / sampleRate
 
 	switch codec.Name {
 	case core.CodecELD, core.CodecOpus:
@@ -340,14 +340,23 @@ func (c *Client) AddTrack(media *core.Media, codec *core.Codec, track *core.Rece
 		log.Printf("[hk-dbg] AddTrack codec=%s trackCodec=%s isRTP=%t pt=%d",
 			codec.Name, track.Codec.Name, track.Codec.IsRTP(), track.Codec.PayloadType)
 
-		var lastSent time.Time
+		var nextSend time.Time
 		var started bool
-		// TALKBACK_PACE=1 restores the legacy 32ms per-AU pacing. Default is
-		// no-pace (send AUs as they arrive): the RTP timestamps already carry
-		// correct playback timing (+512 @16kHz), so the doorbell's jitter buffer
-		// schedules by timestamp. Pacing only ADDS latency by holding each ~14-AU
-		// ffmpeg bundle and dripping it out over ~450ms.
-		pace := os.Getenv("TALKBACK_PACE") == "1"
+		// Per-AU send spacing. ffmpeg packs ~14 AAC-ELD AUs into each RTP packet;
+		// RTPDepay splits them and they arrive here as a rapid burst. Sending the
+		// whole burst instantly overruns the doorbell's jitter buffer (cuts),
+		// while spacing them at the full 32ms realtime rate adds ~450ms standing
+		// latency. Spread each burst at TALKBACK_PACE_MS (default 12ms): fast
+		// enough to keep latency low, gentle enough to avoid buffer overrun.
+		// Non-accumulating: nextSend resets to now after each idle gap, so a
+		// startup burst cannot build permanent standing latency.
+		paceMS := 12
+		if v := os.Getenv("TALKBACK_PACE_MS"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil {
+				paceMS = n
+			}
+		}
+		paceInterval := time.Duration(paceMS) * time.Millisecond
 
 		writeRTP := func(packet *rtp.Packet) {
 			if dbgSendCount < 5 {
@@ -365,24 +374,13 @@ func (c *Client) AddTrack(media *core.Media, codec *core.Codec, track *core.Rece
 			talkspurtStart := !started
 			started = true
 
-			if pace {
-				// Legacy: pace one AU per frame so a bundled ffmpeg packet does
-				// not burst 14 AUs at once. Also re-arm the marker after a gap.
+			if paceInterval > 0 {
 				now := time.Now()
-				if lastSent.IsZero() {
-					lastSent = now
-				} else {
-					expected := lastSent.Add(frameInterval)
-					if now.Before(expected) {
-						time.Sleep(expected.Sub(now))
-						lastSent = expected
-					} else if now.Sub(expected) > 100*time.Millisecond {
-						lastSent = now
-						talkspurtStart = true
-					} else {
-						lastSent = expected
-					}
+				if now.Before(nextSend) {
+					time.Sleep(nextSend.Sub(now))
+					now = nextSend
 				}
+				nextSend = now.Add(paceInterval)
 			}
 
 			// Wrap the raw AU as a single-AU MPEG4-GENERIC payload:
@@ -418,7 +416,32 @@ func (c *Client) AddTrack(media *core.Media, codec *core.Codec, track *core.Rece
 
 		if track.Codec.IsRTP() {
 			// Split bundled MPEG4-GENERIC packets into individual AUs.
-			sender.Handler = aac.RTPDepay(writeRTP)
+			depay := aac.RTPDepay(writeRTP)
+			// TEMP measurement: count AUs per incoming RTP packet and the
+			// wall-clock gap between incoming packets. This tells us whether
+			// ffmpeg is bundling many AUs into one RTP packet (bursty arrival)
+			// or delivering ~1 AU per packet at realtime.
+			var measPrev time.Time
+			var measCount int
+			sender.Handler = func(pkt *rtp.Packet) {
+				if measCount < 20 {
+					now := time.Now()
+					var gapMS int64
+					if !measPrev.IsZero() {
+						gapMS = now.Sub(measPrev).Milliseconds()
+					}
+					measPrev = now
+					// MPEG4-GENERIC: 2-byte AU-headers-length, then N*2-byte AU headers.
+					aus := 0
+					if len(pkt.Payload) >= 2 {
+						hdrBits := int(pkt.Payload[0])<<8 | int(pkt.Payload[1])
+						aus = (hdrBits / 16) // each AU header = 16 bits
+					}
+					log.Printf("[hk-dbg] recv-eld payloadLen=%d aus=%d gapMS=%d", len(pkt.Payload), aus, gapMS)
+					measCount++
+				}
+				depay(pkt)
+			}
 		} else {
 			sender.Handler = writeRTP
 		}

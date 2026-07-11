@@ -110,7 +110,13 @@ var defaults = map[string]string{
 	// camera in SelectedStreamConfiguration (pkg/hap/camera/stream.go); without
 	// it, libfdk_aac's default VBR for ELD runs ~38kbps, well over what we
 	// promised the camera to expect, which some cameras may enforce silently.
-	"eld":        "-c:a libfdk_aac -profile:a aac_eld -ar:a 16000 -ac:a 1 -frame_size 480 -b:a 24k",
+	// -pkt_size 150 forces the RTSP/RTP muxer to emit ~1 AU per RTP packet
+	// (each ELD AU is ~98 bytes). Without it ffmpeg bundles ~14 AUs (448ms of
+	// audio) into one ~1370-byte packet emitted every 448ms: the doorbell then
+	// receives audio in bursts, forcing a choice between big latency (realtime
+	// drain of each bundle) and cutouts (fast drain then silence). One AU per
+	// packet lets us deliver frames at realtime 32ms spacing with low latency.
+	"eld":        "-c:a libfdk_aac -profile:a aac_eld -ar:a 16000 -ac:a 1 -frame_size 480 -b:a 24k -pkt_size 150",
 	"mp3":        "-c:a libmp3lame -q:a 8",
 	"pcm":        "-c:a pcm_s16be -ar:a 8000 -ac:a 1",
 	"pcm/8000":   "-c:a pcm_s16be -ar:a 8000 -ac:a 1",
