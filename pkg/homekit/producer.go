@@ -325,13 +325,16 @@ func timekeeper(handler core.HandlerFunc) core.HandlerFunc {
 // not render; we must split those bundles back to one AU per packet.
 func (c *Client) AddTrack(media *core.Media, codec *core.Codec, track *core.Receiver) error {
 	const sampleRate = 16000
-	// libfdk_aac's aac_eld encoder IGNORES -frame_size 480 and always emits
-	// 512-sample (32ms) frames. Measured empirically: 10s @16kHz -> 314 frames
-	// (160000/314 ~= 512). The RTP timestamp and pacing MUST match the real
-	// frame size, otherwise we feed 32ms of audio every 30ms: the doorbell's
-	// jitter buffer overfills and its audio clock skews, so the speaker plays
-	// the first ~second then mutes. Use 512 to keep the RTP clock at true 16kHz.
-	const sampleSize = 512 // 32ms @ 16kHz — actual libfdk_aac ELD frame length
+	// The eld ffmpeg template now uses -frame_length 480 (libfdk's granule-length
+	// knob; the generic -frame_size is ignored, see internal/ffmpeg/ffmpeg.go), so
+	// libfdk_aac emits true 480-sample (30ms) ELD frames. The RTP timestamp step
+	// MUST match the real frame size: 480 keeps the clock at true 16kHz AND matches
+	// the RTPTime=30 we advertise (helpers.go trackToAudio) so the doorbell frames
+	// each AU correctly. (History: while the encoder wrongly emitted 512-sample
+	// frames, this was 512 to keep the clock right — T10. Fixing the encoder to a
+	// true 480 lets us restore 480 here and end the 480-advertised/512-actual
+	// mismatch that degraded quality — Q1.)
+	const sampleSize = 480 // 30ms @ 16kHz — real libfdk_aac ELD frame length (-frame_length 480)
 
 	switch codec.Name {
 	case core.CodecELD, core.CodecOpus:
