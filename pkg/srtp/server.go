@@ -2,7 +2,6 @@ package srtp
 
 import (
 	"encoding/binary"
-	"log"
 	"net"
 	"strconv"
 	"sync"
@@ -51,14 +50,12 @@ func (s *Server) AddSession(session *Session) {
 	defer s.mu.Unlock()
 
 	if err := session.init(); err != nil {
-		log.Printf("[srtp] AddSession session.init failed: %v", err)
 		return
 	}
 
 	if s.conn == nil {
 		var err error
 		if s.conn, err = net.ListenPacket("udp", s.address); err != nil {
-			log.Printf("[srtp] AddSession ListenPacket failed: %v", err)
 			return
 		}
 		go s.handle()

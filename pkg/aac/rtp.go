@@ -12,6 +12,13 @@ const RTPPacketVersionAAC = 0
 func RTPDepay(handler core.HandlerFunc) core.HandlerFunc {
 	var timestamp uint32
 
+	// RFC 3640 §3.2.3: an AU larger than the packet is split into fragments.
+	// Each fragment carries one AU-header with the size of the WHOLE AU and the
+	// same RTP timestamp; collect them until the AU is complete.
+	var frag []byte
+	var fragSize int
+	var fragTS uint32
+
 	return func(packet *rtp.Packet) {
 		// support ONLY 2 bytes header size!
 		// streamtype=5;profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3;config=1408
@@ -35,6 +42,21 @@ func RTPDepay(handler core.HandlerFunc) core.HandlerFunc {
 
 		headers := packet.Payload[2 : 2+headersSize]
 		units := packet.Payload[2+headersSize:]
+
+		if len(headers) == 2 {
+			unitSize := int(binary.BigEndian.Uint16(headers) >> 3)
+			if frag != nil && (packet.Timestamp != fragTS || unitSize != fragSize) {
+				frag = nil // the rest of the previous AU was lost
+			}
+			if frag != nil || len(units) < unitSize {
+				frag = append(frag, units...)
+				fragSize, fragTS = unitSize, packet.Timestamp
+				if len(frag) < unitSize {
+					return // wait for the next fragment
+				}
+				units, frag = frag[:unitSize], nil
+			}
+		}
 
 		for len(headers) >= 2 {
 			unitSize := binary.BigEndian.Uint16(headers) >> 3

@@ -1,14 +1,11 @@
 package camera
 
 import (
-	"encoding/base64"
 	"errors"
 	"fmt"
-	"log"
 	"net"
 
 	"github.com/AlexxIT/go2rtc/pkg/hap"
-	"github.com/AlexxIT/go2rtc/pkg/hap/tlv8"
 	"github.com/AlexxIT/go2rtc/pkg/srtp"
 	"github.com/google/uuid"
 )
@@ -129,18 +126,6 @@ func (s *Stream) ExchangeEndpoints(videoSession, audioSession *srtp.Session) err
 		},
 	}
 
-	log.Printf("[hap] SetupEndpointsRequest: SessionID=%x IPAddr=%s VideoPort=%d AudioPort=%d VideoKeyLen=%d AudioKeyLen=%d CryptoSuite=%d IPVersion=%d",
-		req.SessionID, req.Address.IPAddr, req.Address.VideoRTPPort, req.Address.AudioRTPPort, len(req.VideoCrypto.MasterKey), len(req.AudioCrypto.MasterKey), req.VideoCrypto.CryptoSuite, req.Address.IPVersion)
-
-	// Hex dump the marshalled TLV8 for debugging
-	debugBytes, debugErr := tlv8.Marshal(&req)
-	if debugErr != nil {
-		log.Printf("[hap] TLV8 marshal debug error: %v", debugErr)
-	} else {
-		log.Printf("[hap] SetupEndpointsRequest TLV8 hex (%d bytes): %x", len(debugBytes), debugBytes)
-		log.Printf("[hap] SetupEndpointsRequest TLV8 base64: %s", base64.StdEncoding.EncodeToString(debugBytes))
-	}
-
 	char := s.service.GetCharacter(TypeSetupEndpoints)
 	if err := char.Write(&req); err != nil {
 		return err
@@ -153,10 +138,6 @@ func (s *Stream) ExchangeEndpoints(videoSession, audioSession *srtp.Session) err
 	if err := s.client.GetCharacter(char); err != nil {
 		return err
 	}
-	if sVal, ok := char.Value.(string); ok {
-		log.Printf("[hap] SetupEndpointsResponse raw base64: %s", sVal)
-	}
-
 	if err := char.ReadTLV8(&res); err != nil {
 		return err
 	}
@@ -175,10 +156,6 @@ func (s *Stream) ExchangeEndpoints(videoSession, audioSession *srtp.Session) err
 	if addr == "0.0.0.0" || addr == "" {
 		addr = cameraIP
 	}
-
-	log.Printf("[hap] ExchangeEndpoints VideoCrypto key=%d salt=%d AudioCrypto key=%d salt=%d",
-		len(res.VideoCrypto.MasterKey), len(res.VideoCrypto.MasterSalt),
-		len(res.AudioCrypto.MasterKey), len(res.AudioCrypto.MasterSalt))
 
 	videoSession.Remote = &srtp.Endpoint{
 		Addr:       addr,
