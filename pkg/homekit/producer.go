@@ -65,7 +65,10 @@ func (c *Client) GetMedias() []*core.Media {
 		return c.Medias
 	}
 
+	// GetMedias called under the stream lock, so don't wait forever for an answer
+	_ = c.hap.Conn.SetDeadline(time.Now().Add(core.ConnDeadline))
 	acc, err := c.hap.GetFirstAccessory()
+	_ = c.hap.Conn.SetDeadline(time.Time{})
 	if err != nil {
 		return nil
 	}
