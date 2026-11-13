@@ -76,6 +76,7 @@ func (s *Stream) Play(urlOrProd any) error {
 		// start new producer
 		if src == nil {
 			if src, err = GetProducer(source); err != nil {
+				_ = dst.Stop()
 				return err
 			}
 		}
@@ -103,6 +104,11 @@ func (s *Stream) Play(urlOrProd any) error {
 		}()
 
 		return nil
+	}
+
+	// stop producer only if it was created here
+	if src != nil && source != "" {
+		_ = src.Stop()
 	}
 
 	return errors.New("can't find consumer")
