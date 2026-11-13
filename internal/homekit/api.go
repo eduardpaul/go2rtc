@@ -143,6 +143,9 @@ func apiPair(id, url string) error {
 		return err
 	}
 
+	// pair-setup connection is not usable for requests
+	_ = conn.Close()
+
 	streams.New(id, conn.URL())
 
 	return app.PatchConfig([]string{"streams", id}, conn.URL())
