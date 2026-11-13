@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net"
 	"net/url"
+	"time"
 
 	"github.com/AlexxIT/go2rtc/pkg/hap/chacha20poly1305"
 	"github.com/AlexxIT/go2rtc/pkg/hap/ed25519"
@@ -77,11 +78,21 @@ func (c *Client) Pair(feature, pin string) (err error) {
 		return err
 	}
 
-	c.Conn, err = net.DialTimeout("tcp", c.DeviceAddress, ConnDialTimeout)
+	conn, err := net.DialTimeout("tcp", c.DeviceAddress, ConnDialTimeout)
 	if err != nil {
 		return
 	}
 
+	defer func() {
+		if err != nil {
+			_ = conn.Close()
+		}
+	}()
+
+	// device can accept TCP and never answer, SRP can be slow on some devices
+	_ = conn.SetDeadline(time.Now().Add(PairSetupDeadline))
+
+	c.Conn = conn
 	c.reader = bufio.NewReader(c.Conn)
 
 	// STEP M1. Send HELLO
@@ -271,6 +282,8 @@ func (c *Client) Pair(feature, pin string) (err error) {
 	}
 
 	c.DevicePublic = []byte(plainM6.PublicKey)
+
+	_ = conn.SetDeadline(time.Time{})
 
 	return nil
 }

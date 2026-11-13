@@ -23,8 +23,9 @@ import (
 )
 
 const (
-	ConnDialTimeout = time.Second * 3
-	ConnDeadline    = time.Second * 3
+	ConnDialTimeout   = time.Second * 3
+	ConnDeadline      = time.Second * 3
+	PairSetupDeadline = time.Second * 30
 )
 
 // Client for HomeKit. DevicePublic can be null.
@@ -99,11 +100,22 @@ func (c *Client) Dial() (err error) {
 		return false
 	})
 
-	// TODO: close conn on error
-	if c.Conn, err = net.DialTimeout("tcp", c.DeviceAddress, ConnDialTimeout); err != nil {
+	conn, err := net.DialTimeout("tcp", c.DeviceAddress, ConnDialTimeout)
+	if err != nil {
 		return
 	}
 
+	return c.pairVerify(conn)
+}
+
+func (c *Client) pairVerify(conn net.Conn) (err error) {
+	defer func() {
+		if err != nil {
+			_ = conn.Close()
+		}
+	}()
+
+	c.Conn = conn
 	c.reader = bufio.NewReader(c.Conn)
 
 	// STEP M1: send our session public to device
@@ -117,6 +129,8 @@ func (c *Client) Dial() (err error) {
 		PublicKey: string(sessionPublic),
 		State:     StateM1,
 	}
+	// device can accept TCP and never answer
+	_ = conn.SetDeadline(time.Now().Add(ConnDeadline))
 	res, err := c.Post(PathPairVerify, MimeTLV8, tlv8.MarshalReader(plainM1))
 	if err != nil {
 		return
@@ -205,6 +219,7 @@ func (c *Client) Dial() (err error) {
 		State:         StateM3,
 		EncryptedData: string(b),
 	}
+	_ = conn.SetDeadline(time.Now().Add(ConnDeadline))
 	if res, err = c.Post(PathPairVerify, MimeTLV8, tlv8.MarshalReader(cipherM3)); err != nil {
 		return
 	}
@@ -219,6 +234,9 @@ func (c *Client) Dial() (err error) {
 	if plainM4.State != StateM4 {
 		return newResponseError(cipherM3, plainM4)
 	}
+
+	// remove deadline for persistent connection
+	_ = conn.SetDeadline(time.Time{})
 
 	rw := bufio.NewReadWriter(c.reader, bufio.NewWriter(c.Conn))
 
