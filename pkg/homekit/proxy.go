@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -24,12 +25,17 @@ type ServerProxy interface {
 func ProxyHandler(srv ServerProxy, acc net.Conn) HandlerFunc {
 	return func(con net.Conn) error {
 		defer con.Close()
+		// accessory conn belongs to this controller conn only
+		defer acc.Close()
 
 		pr := &Proxy{
-			con: con.(*hap.Conn),
-			acc: acc.(*hap.Conn),
-			res: make(chan *http.Response),
+			con:  con.(*hap.Conn),
+			acc:  acc.(*hap.Conn),
+			res:  make(chan *http.Response),
+			done: make(chan struct{}),
 		}
+
+		defer close(pr.done)
 
 		// accessory (ex. Camera) => controller (ex. iPhone)
 		go pr.handleAcc()
@@ -40,9 +46,10 @@ func ProxyHandler(srv ServerProxy, acc net.Conn) HandlerFunc {
 }
 
 type Proxy struct {
-	con *hap.Conn
-	acc *hap.Conn
-	res chan *http.Response
+	con  *hap.Conn
+	acc  *hap.Conn
+	res  chan *http.Response
+	done chan struct{}
 }
 
 func (p *Proxy) handleCon(srv ServerProxy) error {
@@ -86,7 +93,10 @@ func (p *Proxy) handleCon(srv ServerProxy) error {
 			return err
 		}
 
-		res := <-p.res
+		res, ok := <-p.res
+		if !ok {
+			return errors.New("homekit: accessory conn closed")
+		}
 
 		switch {
 		case req.Method == "GET" && req.URL.Path == hap.PathAccessories:
@@ -140,6 +150,10 @@ func (p *Proxy) handleCon(srv ServerProxy) error {
 }
 
 func (p *Proxy) handleAcc() error {
+	defer close(p.res)
+	// stop controller conn if accessory conn is broken
+	defer p.con.Close()
+
 	rd := bufio.NewReader(p.acc)
 	for {
 		res, err := hap.ReadResponse(rd, nil)
@@ -161,7 +175,11 @@ func (p *Proxy) handleAcc() error {
 		}
 		res.Body = io.NopCloser(bytes.NewReader(body))
 
-		p.res <- res
+		select {
+		case p.res <- res:
+		case <-p.done:
+			return nil
+		}
 	}
 }
 
