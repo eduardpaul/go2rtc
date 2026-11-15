@@ -250,13 +250,6 @@ func (p *Producer) stop() {
 	case stateExternal:
 		log.Trace().Msgf("[streams] skip stop external producer")
 		return
-	case stateInternal:
-		// A source started by Stream.Play (e.g. a backchannel route) runs
-		// until its own source ends or the next Play replaces it. Its tracks
-		// are not recorded in receivers, so it would otherwise look idle and
-		// be stopped every time any consumer of the stream leaves.
-		log.Trace().Msgf("[streams] skip stop internal producer")
-		return
 	case stateNone:
 		log.Trace().Msgf("[streams] skip stop none producer")
 		return

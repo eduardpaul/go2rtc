@@ -71,28 +71,3 @@ func TestPlayStopSrcWithoutConsumer(t *testing.T) {
 	require.NotNil(t, src)
 	require.True(t, src.stopped)
 }
-
-func TestPlayRouteSurvivesConsumerLeaving(t *testing.T) {
-	HandleFunc("playdst", func(string) (core.Producer, error) {
-		return &playConn{}, nil
-	})
-
-	stream, err := New("play_route_survives", "playdst:")
-	require.NoError(t, err)
-	t.Cleanup(func() { Delete("play_route_survives") })
-
-	route := &playConn{}
-	stream.AddInternalProducer(route)
-
-	// A viewer (e.g. a snapshot request) comes and goes.
-	viewer := &playConn{}
-	stream.AddInternalConsumer(viewer)
-	stream.RemoveConsumer(viewer)
-
-	require.False(t, route.stopped)
-	require.Len(t, stream.producers, 2)
-
-	// When the route ends, Play's goroutine removes it from the list.
-	stream.RemoveProducer(route)
-	require.Len(t, stream.producers, 1)
-}
